@@ -3,11 +3,12 @@ package peernode
 import (
 	"context"
 	"fmt"
+	"log"
+
 	"github.com/seoyhaein/go-grpc-kit/client"
 	globallog "github.com/seoyhaein/go-grpc-kit/log"
 	"github.com/seoyhaein/go-grpc-kit/server"
 	"google.golang.org/grpc"
-	"log"
 )
 
 var logger = globallog.Log

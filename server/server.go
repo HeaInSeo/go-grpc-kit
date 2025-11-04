@@ -6,6 +6,10 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log"
+	"net"
+	"os"
+
 	globallog "github.com/seoyhaein/go-grpc-kit/log"
 	"github.com/seoyhaein/go-grpc-kit/server/config"
 	"google.golang.org/grpc"
@@ -13,9 +17,6 @@ import (
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
-	"log"
-	"net"
-	"os"
 )
 
 var logger = globallog.Log

@@ -5,11 +5,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"os"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
-	"os"
 )
 
 // Option defines a functional option for the Dial function

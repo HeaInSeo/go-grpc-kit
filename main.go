@@ -1,10 +1,11 @@
 package main
 
 import (
+	"log"
+
 	"github.com/seoyhaein/go-grpc-kit/client"
 	"github.com/seoyhaein/go-grpc-kit/peernode"
 	"github.com/seoyhaein/go-grpc-kit/server"
-	"log"
 )
 
 // main.go

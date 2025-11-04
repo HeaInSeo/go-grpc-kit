@@ -2,10 +2,11 @@ package config
 
 import (
 	"errors"
-	globallog "github.com/seoyhaein/go-grpc-kit/log"
-	"github.com/spf13/viper"
 	"os"
 	"path/filepath"
+
+	globallog "github.com/seoyhaein/go-grpc-kit/log"
+	"github.com/spf13/viper"
 )
 
 var logger = globallog.Log
