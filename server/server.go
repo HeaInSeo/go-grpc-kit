@@ -63,28 +63,22 @@ func WithTLS(certFile, keyFile string) grpc.ServerOption {
 	return grpc.Creds(creds)
 }
 
-// WithMTLS 는 mTLS용 ServerOption을 반환합니다.
-// - certFile: 서버 인증서 (PEM)
-// - keyFile: 서버 개인키 (PEM)
-// - caFile: 신뢰할 CA 인증서 (PEM)
-func WithMTLS(certFile, keyFile, caFile string) grpc.ServerOption {
-	// 1) 서버 인증서/키 로드
+// WithMTLSOption 은 mTLS 설정을 적용하고 에러를 반환할 수 있는 안전한 함수입니다.
+func WithMTLSOption(certFile, keyFile, caFile string) (grpc.ServerOption, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		log.Fatalf("failed to load server key pair: %v", err)
+		return nil, fmt.Errorf("failed to load server key pair: %w", err)
 	}
 
-	// 2) CA 인증서 로드
 	caPEM, err := os.ReadFile(caFile)
 	if err != nil {
-		log.Fatalf("failed to read CA cert: %v", err)
+		return nil, fmt.Errorf("failed to read CA cert: %w", err)
 	}
 	certPool := x509.NewCertPool()
 	if ok := certPool.AppendCertsFromPEM(caPEM); !ok {
-		log.Fatalf("failed to append CA cert to pool")
+		return nil, errors.New("failed to append CA cert to pool")
 	}
 
-	// 3) TLS 설정: 클라이언트 인증서 필수 및 검증
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
@@ -93,7 +87,16 @@ func WithMTLS(certFile, keyFile, caFile string) grpc.ServerOption {
 	}
 
 	creds := credentials.NewTLS(tlsConfig)
-	return grpc.Creds(creds)
+	return grpc.Creds(creds), nil
+}
+
+// WithMTLS 는 mTLS용 ServerOption을 반환합니다. (에러 발생 시 log.Fatalf 호출하므로 주의)
+func WithMTLS(certFile, keyFile, caFile string) grpc.ServerOption {
+	opt, err := WithMTLSOption(certFile, keyFile, caFile)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	return opt
 }
 
 // WithHealthCheck 는 grpc 서버에 Health Check 서비스를 등록하는 콜백을 반환

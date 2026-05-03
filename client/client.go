@@ -20,6 +20,8 @@ type dialOptions struct {
 	dialOpts []grpc.DialOption
 	// TLS configuration (if any)
 	tlsCfg *tls.Config
+	err    error
+	block  bool
 }
 
 // WithInsecure disables transport security (for testing or plaintext communication)
@@ -31,17 +33,18 @@ func WithInsecure() Option {
 
 // WithTLS configures the client to use TLS with the given CA certificate
 // certFile is ignored (client auth not used)
-// TODO panic 지우는 것 생각해보자.
 func WithTLS(caFile string) Option {
 	return func(o *dialOptions) {
 		// Load CA cert
 		caPEM, err := os.ReadFile(caFile)
 		if err != nil {
-			panic(fmt.Sprintf("failed to read CA certificate: %v", err))
+			o.err = fmt.Errorf("failed to read CA certificate: %w", err)
+			return
 		}
 		certPool := x509.NewCertPool()
 		if !certPool.AppendCertsFromPEM(caPEM) {
-			panic("failed to append CA certificate to pool")
+			o.err = fmt.Errorf("failed to append CA certificate to pool")
+			return
 		}
 		// Build TLS config
 		tlsCfg := &tls.Config{
@@ -59,16 +62,19 @@ func WithMTLS(certFile, keyFile, caFile string) Option {
 		// Load client certificate and key
 		clientCert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
-			panic(fmt.Sprintf("failed to load client key pair: %v", err))
+			o.err = fmt.Errorf("failed to load client key pair: %w", err)
+			return
 		}
 		// Load CA cert
 		caPEM, err := os.ReadFile(caFile)
 		if err != nil {
-			panic(fmt.Sprintf("failed to read CA certificate: %v", err))
+			o.err = fmt.Errorf("failed to read CA certificate: %w", err)
+			return
 		}
 		certPool := x509.NewCertPool()
 		if !certPool.AppendCertsFromPEM(caPEM) {
-			panic("failed to append CA certificate to pool")
+			o.err = fmt.Errorf("failed to append CA certificate to pool")
+			return
 		}
 		// Build TLS config with mTLS
 		tlsCfg := &tls.Config{
@@ -88,13 +94,23 @@ func WithDialOption(opt grpc.DialOption) Option {
 	}
 }
 
+// WithBlock enables blocking dial (wait until connection is ready) without relying on deprecated grpc.WithBlock()
+func WithBlock() Option {
+	return func(o *dialOptions) {
+		o.block = true
+	}
+}
+
 // Dial establishes a gRPC ClientConn using grpc.NewClient instead of DialContext.
-// It respects grpc.WithBlock and will wait for readiness using the provided context.
+// It respects kit_client.WithBlock() and will wait for readiness using the provided context.
 func Dial(ctx context.Context, target string, opts ...Option) (*grpc.ClientConn, error) {
 	// Collect options
 	dcfg := &dialOptions{}
 	for _, opt := range opts {
 		opt(dcfg)
+		if dcfg.err != nil {
+			return nil, dcfg.err
+		}
 	}
 	// Default to insecure if no credentials provided
 	if len(dcfg.dialOpts) == 0 {
@@ -102,9 +118,9 @@ func Dial(ctx context.Context, target string, opts ...Option) (*grpc.ClientConn,
 	}
 
 	// Determine if blocking dial is requested
-	block := false
+	block := dcfg.block
 	for _, o := range dcfg.dialOpts {
-		// Inspect string repr to detect WithBlock (no other way)
+		// Inspect string repr to detect legacy WithBlock
 		if fmt.Sprint(o) == "WithBlock()" {
 			block = true
 			break
