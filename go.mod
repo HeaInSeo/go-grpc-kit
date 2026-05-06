@@ -1,4 +1,4 @@
-module github.com/seoyhaein/go-grpc-kit
+module github.com/HeaInSeo/go-grpc-kit
 
 go 1.25.5
 

@@ -6,12 +6,11 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"os"
 
-	globallog "github.com/seoyhaein/go-grpc-kit/log"
-	"github.com/seoyhaein/go-grpc-kit/server/config"
+	globallog "github.com/HeaInSeo/go-grpc-kit/log"
+	"github.com/HeaInSeo/go-grpc-kit/server/config"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
@@ -25,25 +24,22 @@ func init() {
 	// TODO: Prometheus 적용 예정
 }
 
+// RegisterServices is a callback that registers one or more gRPC services on a server.
 type RegisterServices func(*grpc.Server)
 
-// 기본값 상수들
-
-// WithUnaryInterceptors 는 추가 Unary 인터셉터를 등록
+// WithUnaryInterceptors registers additional Unary interceptors.
 func WithUnaryInterceptors(interceptors ...grpc.UnaryServerInterceptor) grpc.ServerOption {
 	return grpc.ChainUnaryInterceptor(interceptors...)
 }
 
-// WithStreamInterceptors 는 추가 Stream 인터셉터를 등록
+// WithStreamInterceptors registers additional Stream interceptors.
 func WithStreamInterceptors(interceptors ...grpc.StreamServerInterceptor) grpc.ServerOption {
 	return grpc.ChainStreamInterceptor(interceptors...)
 }
 
-// DefaultServerOptions 는 functional 옵션들을 받아 grpc.ServerOption 리스트 반환
+// DefaultServerOptions returns base grpc.ServerOptions with logging interceptors and message size limits.
 func DefaultServerOptions(opts ...grpc.ServerOption) []grpc.ServerOption {
 	cfg := config.LoadServerConfig()
-
-	// 기본 interceptor 설정
 	base := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(loggingInterceptor),
 		grpc.ChainStreamInterceptor(streamLoggingInterceptor),
@@ -54,22 +50,21 @@ func DefaultServerOptions(opts ...grpc.ServerOption) []grpc.ServerOption {
 	return append(base, opts...)
 }
 
-// WithTLS 는 TLS 인증서를 grpc 서버에 적용할 수 있는 ServerOption 반환
-func WithTLS(certFile, keyFile string) grpc.ServerOption {
+// WithTLSOption loads server TLS credentials from files and returns a ServerOption.
+func WithTLSOption(certFile, keyFile string) (grpc.ServerOption, error) {
 	creds, err := credentials.NewServerTLSFromFile(certFile, keyFile)
 	if err != nil {
-		logger.Fatalf("failed to load TLS credentials: %v", err)
+		return nil, fmt.Errorf("failed to load TLS credentials: %w", err)
 	}
-	return grpc.Creds(creds)
+	return grpc.Creds(creds), nil
 }
 
-// WithMTLSOption 은 mTLS 설정을 적용하고 에러를 반환할 수 있는 안전한 함수입니다.
+// WithMTLSOption loads mTLS credentials (server cert + CA for client verification) and returns a ServerOption.
 func WithMTLSOption(certFile, keyFile, caFile string) (grpc.ServerOption, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load server key pair: %w", err)
 	}
-
 	caPEM, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read CA cert: %w", err)
@@ -78,65 +73,49 @@ func WithMTLSOption(certFile, keyFile, caFile string) (grpc.ServerOption, error)
 	if ok := certPool.AppendCertsFromPEM(caPEM); !ok {
 		return nil, errors.New("failed to append CA cert to pool")
 	}
-
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    certPool,
 		MinVersion:   tls.VersionTLS12,
 	}
-
-	creds := credentials.NewTLS(tlsConfig)
-	return grpc.Creds(creds), nil
+	return grpc.Creds(credentials.NewTLS(tlsConfig)), nil
 }
 
-// WithMTLS 는 mTLS용 ServerOption을 반환합니다. (에러 발생 시 log.Fatalf 호출하므로 주의)
-func WithMTLS(certFile, keyFile, caFile string) grpc.ServerOption {
-	opt, err := WithMTLSOption(certFile, keyFile, caFile)
-	if err != nil {
-		log.Fatalf("%v", err)
-	}
-	return opt
+// RegisterHealth registers the gRPC Health service and returns the *health.Server so callers
+// can update serving status at runtime (e.g. STARTING → SERVING → NOT_SERVING on shutdown).
+func RegisterHealth(grpcServer *grpc.Server) *health.Server {
+	h := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(grpcServer, h)
+	h.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	return h
 }
 
-// WithHealthCheck 는 grpc 서버에 Health Check 서비스를 등록하는 콜백을 반환
+// WithHealthCheck returns a RegisterServices callback that registers the gRPC Health service.
+// Use RegisterHealth instead when you need to update the serving status at runtime.
 func WithHealthCheck() RegisterServices {
 	return func(grpcServer *grpc.Server) {
-		healthServer := health.NewServer()
-		grpc_health_v1.RegisterHealthServer(grpcServer, healthServer)
-		healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+		RegisterHealth(grpcServer)
 	}
 }
 
-// WithReflection 는 grpc 서버에 Reflection 서비스를 등록하는 콜백을 반환
+// WithReflection returns a RegisterServices callback that registers gRPC reflection (dev/test only).
 func WithReflection() RegisterServices {
 	return func(grpcServer *grpc.Server) {
 		reflection.Register(grpcServer)
 	}
 }
 
-// Server 함수는 서비스 등록 함수(들)을 variadic 인자로 받는다
+// Server starts a blocking gRPC server on the given address.
 func Server(address string, opts []grpc.ServerOption, registerServices ...RegisterServices) error {
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", address, err)
 	}
-	// ServerOption 설정
 	grpcServer := grpc.NewServer(opts...)
-	// RegisterServices 를 순회하며 각 서비스 등록
-	for _, registerServiceServer := range registerServices {
-		registerServiceServer(grpcServer)
+	for _, reg := range registerServices {
+		reg(grpcServer)
 	}
-	/*// graceful shutdown 처리 추가
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		sig := <-sigCh
-		logger.Infof("Received signal: %v. Initiating graceful shutdown...", sig)
-		// GracefulStop 은 현재 처리 중인 요청을 모두 완료한 후 서버를 중지함
-		grpcServer.GracefulStop()
-	}()*/
-	// 서버 시작
 	serveErr := grpcServer.Serve(lis)
 	if serveErr != nil && !errors.Is(serveErr, grpc.ErrServerStopped) {
 		return serveErr
@@ -144,28 +123,28 @@ func Server(address string, opts []grpc.ServerOption, registerServices ...Regist
 	return nil
 }
 
-func ServerAsync(address string, opts []grpc.ServerOption, registerServices ...RegisterServices) (*grpc.Server, error) {
+// ServerAsync starts a non-blocking gRPC server.
+// Returns the *grpc.Server for lifecycle control and a channel that receives any serve error.
+// The channel is closed when the server exits cleanly (GracefulStop/Stop).
+func ServerAsync(address string, opts []grpc.ServerOption, registerServices ...RegisterServices) (*grpc.Server, <-chan error, error) {
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
-		return nil, fmt.Errorf("failed to listen on %s: %w", address, err)
+		return nil, nil, fmt.Errorf("failed to listen on %s: %w", address, err)
 	}
-	// ServerOption 설정
 	grpcServer := grpc.NewServer(opts...)
-	// RegisterServices 를 순회하며 각 서비스 등록
-	for _, registerServiceServer := range registerServices {
-		registerServiceServer(grpcServer)
+	for _, reg := range registerServices {
+		reg(grpcServer)
 	}
-	// 비동기로 Serve
+	errCh := make(chan error, 1)
 	go func() {
 		if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-			logger.Errorf("serve error: %v", err)
+			errCh <- err
 		}
+		close(errCh)
 	}()
-	return grpcServer, nil
+	return grpcServer, errCh, nil
 }
 
-// gRPC 요청을 받을 때마다 요청 메서드와 에러 정보를 로깅함
-// Unary gRPC 요청 로깅 인터셉터
 func loggingInterceptor(
 	ctx context.Context,
 	req interface{},
@@ -180,7 +159,6 @@ func loggingInterceptor(
 	return resp, err
 }
 
-// Stream gRPC 요청 로깅 인터셉터
 func streamLoggingInterceptor(
 	srv interface{},
 	ss grpc.ServerStream,

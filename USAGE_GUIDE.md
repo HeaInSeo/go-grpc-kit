@@ -19,7 +19,7 @@ import (
 	"log"
 	"net"
 
-	kit_server "github.com/seoyhaein/go-grpc-kit/server"
+	kit_server "github.com/HeaInSeo/go-grpc-kit/server"
 	"google.golang.org/grpc"
 	
 	// 프로젝트별 Protobuf Import
@@ -36,14 +36,19 @@ func main() {
 	opts := kit_server.DefaultServerOptions()
 	
 	// mTLS가 필요하다면 아래 옵션 주석 해제
-	// opts = append(opts, kit_server.WithMTLS("server.crt", "server.key", "ca.crt"))
+	// mtlsOpt, err := kit_server.WithMTLSOption("server.crt", "server.key", "ca.crt")
+	// if err != nil { log.Fatalf("failed to load mTLS credentials: %v", err) }
+	// opts = append(opts, mtlsOpt)
 
 	// 2. 표준 grpc.NewServer 에 옵션 주입
 	grpcServer := grpc.NewServer(opts...)
 
-	// 3. HealthCheck 및 Reflection 플러그인 결합 (콜백 형태로 동작)
-	kit_server.WithHealthCheck()(grpcServer)
-	kit_server.WithReflection()(grpcServer)
+	// 3. HealthCheck 등록 — h를 통해 런타임 상태 변경 가능 (SERVING / NOT_SERVING)
+	h := kit_server.RegisterHealth(grpcServer)
+	_ = h // e.g. h.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+
+	// Reflection은 dev/test에서만 활성화할 것. 운영 환경에서는 서비스 구조가 외부에 노출됩니다.
+	// kit_server.WithReflection()(grpcServer)
 
 	// 4. 실제 비즈니스 서비스(Tori 등) 등록
 	// pb.RegisterDataBlockServiceServer(grpcServer, &myServiceHandler{})
@@ -69,8 +74,7 @@ import (
 	"log"
 	"time"
 
-	kit_client "github.com/seoyhaein/go-grpc-kit/client"
-	"google.golang.org/grpc"
+	kit_client "github.com/HeaInSeo/go-grpc-kit/client"
 )
 
 func main() {
@@ -84,11 +88,14 @@ func main() {
 	conn, err := kit_client.Dial(ctx, target,
 		// 인증서 없는 내부 통신 시
 		kit_client.WithInsecure(),
-		
+
 		// mTLS 사용 시
 		// kit_client.WithMTLS("client.crt", "client.key", "ca.crt"),
-		
-		kit_client.WithDialOption(grpc.WithBlock()), // 연결 상태(Ready)가 될 때까지 대기
+
+		// K8s 환경에서 IP로 접속하고 cert SAN이 hostname일 때
+		// kit_client.WithServerName("nodevault.default.svc.cluster.local"),
+
+		kit_client.WithBlock(), // 연결 상태(Ready)가 될 때까지 대기
 	)
 	if err != nil {
 		log.Fatalf("failed to connect: %v", err)

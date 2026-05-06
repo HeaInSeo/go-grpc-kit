@@ -45,15 +45,15 @@ func TestGenerateSelfSignedCA(t *testing.T) {
 
 	// Test with options
 	customSubject := pkix.Name{CommonName: "Custom CA"}
-	caCertWithOptions, caKeyWithOptions, err := GenerateSelfSignedCA(1*time.Hour, WithSubject(customSubject), WithKeySize(1024))
+	caCertWithOptions, caKeyWithOptions, err := GenerateSelfSignedCA(1*time.Hour, WithSubject(customSubject), WithKeySize(2048))
 	if err != nil {
 		t.Fatalf("GenerateSelfSignedCA with options failed: %v", err)
 	}
 	if caCertWithOptions.Subject.CommonName != "Custom CA" {
 		t.Errorf("CA certificate CommonName with option mismatch, got %s", caCertWithOptions.Subject.CommonName)
 	}
-	if caKeyWithOptions.PublicKey.N.BitLen() != 1024 {
-		t.Errorf("Expected 1024-bit key, got %d-bit", caKeyWithOptions.PublicKey.N.BitLen())
+	if caKeyWithOptions.PublicKey.N.BitLen() != 2048 {
+		t.Errorf("Expected 2048-bit key, got %d-bit", caKeyWithOptions.PublicKey.N.BitLen())
 	}
 }
 
@@ -110,7 +110,7 @@ func TestGenerateCert(t *testing.T) {
 	customSubject := pkix.Name{CommonName: "another-cert", Organization: []string{"MyOrg"}}
 
 	certWithOptions, err := GenerateCert(caCert, caKey, 1*time.Hour,
-		WithKeySize(1024),
+		WithKeySize(2048),
 		WithSignatureAlgorithm(x509.SHA512WithRSA),
 		WithSerialNumber(customSerial),
 		WithSubject(customSubject),
@@ -145,8 +145,8 @@ func TestGenerateCert(t *testing.T) {
 		t.Errorf("ExtKeyUsage mismatch")
 	}
 	pub := certWithOptions.PrivateKey.(*rsa.PrivateKey).PublicKey
-	if pub.N.BitLen() != 1024 {
-		t.Errorf("Expected 1024-bit key, got %d-bit", pub.N.BitLen())
+	if pub.N.BitLen() != 2048 {
+		t.Errorf("Expected 2048-bit key, got %d-bit", pub.N.BitLen())
 	}
 }
 
@@ -307,10 +307,62 @@ func TestSavePEM(t *testing.T) {
 	}
 }
 
+// TestGenerateServerCert_IPSAN verifies that an IP address host gets an IP SAN, not a DNS SAN.
+func TestGenerateServerCert_IPSAN(t *testing.T) {
+	caCert, caKey, err := GenerateSelfSignedCA(time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateSelfSignedCA failed: %v", err)
+	}
+	cert, err := GenerateServerCert(caCert, caKey, "127.0.0.1", time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateServerCert with IP host failed: %v", err)
+	}
+	if len(cert.Leaf.IPAddresses) != 1 || cert.Leaf.IPAddresses[0].String() != "127.0.0.1" {
+		t.Errorf("expected IP SAN 127.0.0.1, got IPAddresses=%v DNSNames=%v", cert.Leaf.IPAddresses, cert.Leaf.DNSNames)
+	}
+	if len(cert.Leaf.DNSNames) != 0 {
+		t.Errorf("expected no DNS SANs for IP host, got %v", cert.Leaf.DNSNames)
+	}
+}
+
+// TestGenerateCert_NilCA verifies that GenerateCert rejects nil CA inputs.
+func TestGenerateCert_NilCA(t *testing.T) {
+	caCert, caKey, _ := GenerateSelfSignedCA(time.Hour)
+
+	if _, err := GenerateCert(nil, caKey, time.Hour); err == nil {
+		t.Error("expected error for nil caCert")
+	}
+	if _, err := GenerateCert(caCert, nil, time.Hour); err == nil {
+		t.Error("expected error for nil caKey")
+	}
+}
+
+// TestGenerateCert_NonCAIssuer verifies that GenerateCert rejects a non-CA certificate as issuer.
+func TestGenerateCert_NonCAIssuer(t *testing.T) {
+	caCert, caKey, _ := GenerateSelfSignedCA(time.Hour)
+	// Generate a leaf cert, then try to use it as a CA.
+	leafCert, err := GenerateServerCert(caCert, caKey, "localhost", time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateServerCert failed: %v", err)
+	}
+	leafX509 := leafCert.Leaf
+	_, err = GenerateCert(leafX509, caKey, time.Hour)
+	if err == nil {
+		t.Error("expected error when using non-CA cert as issuer")
+	}
+}
+
+// TestWithKeySize_TooSmall verifies that key sizes below 2048 are rejected.
+func TestWithKeySize_TooSmall(t *testing.T) {
+	_, _, err := GenerateSelfSignedCA(time.Hour, WithKeySize(1024))
+	if err == nil {
+		t.Error("expected error for 1024-bit key size")
+	}
+}
+
 // TestErrorPaths tests various error conditions to increase coverage.
 func TestErrorPaths(t *testing.T) {
-	// Test makeCert with bad key size (unlikely to fail rsa.GenerateKey but demonstrates path)
-	_, _, _, err := makeCert(nil, nil, 1*time.Hour, WithKeySize(10)) // Too small key size
+	_, _, _, err := makeCert(nil, nil, 1*time.Hour, WithKeySize(10))
 	if err == nil {
 		t.Error("makeCert with invalid key size did not return error")
 	}

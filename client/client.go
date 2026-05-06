@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 
@@ -13,29 +14,37 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Option defines a functional option for the Dial function
+// Option defines a functional option for Dial.
 type Option func(*dialOptions)
 
 type dialOptions struct {
-	dialOpts []grpc.DialOption
-	// TLS configuration (if any)
-	tlsCfg *tls.Config
-	err    error
-	block  bool
+	dialOpts                []grpc.DialOption
+	tlsCfg                  *tls.Config // deferred; finalized in Dial with serverName
+	hasTransportCredentials bool
+	serverName              string
+	err                     error
+	block                   bool
 }
 
-// WithInsecure disables transport security (for testing or plaintext communication)
+// WithInsecure disables transport security. Use only in development or testing.
 func WithInsecure() Option {
 	return func(o *dialOptions) {
+		if o.hasTransportCredentials {
+			o.err = errors.New("transport credentials already set; cannot combine WithInsecure with other TLS options")
+			return
+		}
 		o.dialOpts = append(o.dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		o.hasTransportCredentials = true
 	}
 }
 
-// WithTLS configures the client to use TLS with the given CA certificate
-// certFile is ignored (client auth not used)
+// WithTLS configures one-way TLS using the given CA certificate file.
 func WithTLS(caFile string) Option {
 	return func(o *dialOptions) {
-		// Load CA cert
+		if o.hasTransportCredentials {
+			o.err = errors.New("transport credentials already set; cannot combine multiple TLS options")
+			return
+		}
 		caPEM, err := os.ReadFile(caFile)
 		if err != nil {
 			o.err = fmt.Errorf("failed to read CA certificate: %w", err)
@@ -43,29 +52,29 @@ func WithTLS(caFile string) Option {
 		}
 		certPool := x509.NewCertPool()
 		if !certPool.AppendCertsFromPEM(caPEM) {
-			o.err = fmt.Errorf("failed to append CA certificate to pool")
+			o.err = errors.New("failed to append CA certificate to pool")
 			return
 		}
-		// Build TLS config
-		tlsCfg := &tls.Config{
+		o.tlsCfg = &tls.Config{
 			RootCAs:    certPool,
 			MinVersion: tls.VersionTLS12,
 		}
-		creds := credentials.NewTLS(tlsCfg)
-		o.dialOpts = append(o.dialOpts, grpc.WithTransportCredentials(creds))
+		o.hasTransportCredentials = true
 	}
 }
 
-// WithMTLS configures mutual TLS using client certificate, key and CA certificate
+// WithMTLS configures mutual TLS using client certificate, key, and CA certificate files.
 func WithMTLS(certFile, keyFile, caFile string) Option {
 	return func(o *dialOptions) {
-		// Load client certificate and key
+		if o.hasTransportCredentials {
+			o.err = errors.New("transport credentials already set; cannot combine multiple TLS options")
+			return
+		}
 		clientCert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			o.err = fmt.Errorf("failed to load client key pair: %w", err)
 			return
 		}
-		// Load CA cert
 		caPEM, err := os.ReadFile(caFile)
 		if err != nil {
 			o.err = fmt.Errorf("failed to read CA certificate: %w", err)
@@ -73,38 +82,61 @@ func WithMTLS(certFile, keyFile, caFile string) Option {
 		}
 		certPool := x509.NewCertPool()
 		if !certPool.AppendCertsFromPEM(caPEM) {
-			o.err = fmt.Errorf("failed to append CA certificate to pool")
+			o.err = errors.New("failed to append CA certificate to pool")
 			return
 		}
-		// Build TLS config with mTLS
-		tlsCfg := &tls.Config{
+		o.tlsCfg = &tls.Config{
 			Certificates: []tls.Certificate{clientCert},
 			RootCAs:      certPool,
 			MinVersion:   tls.VersionTLS12,
 		}
-		creds := credentials.NewTLS(tlsCfg)
-		o.dialOpts = append(o.dialOpts, grpc.WithTransportCredentials(creds))
+		o.hasTransportCredentials = true
 	}
 }
 
-// WithDialOption allows passing a raw grpc.DialOption
+// WithTLSConfig injects a pre-built *tls.Config directly, for advanced use cases.
+// WithServerName applied after this option will still override ServerName.
+func WithTLSConfig(cfg *tls.Config) Option {
+	return func(o *dialOptions) {
+		if o.hasTransportCredentials {
+			o.err = errors.New("transport credentials already set; cannot combine multiple TLS options")
+			return
+		}
+		if cfg == nil {
+			o.err = errors.New("tls.Config must not be nil")
+			return
+		}
+		o.tlsCfg = cfg
+		o.hasTransportCredentials = true
+	}
+}
+
+// WithServerName overrides the ServerName used in TLS handshake.
+// Useful when dialing by IP address or a hostname that differs from the server cert SAN.
+// Must be used together with WithTLS, WithMTLS, or WithTLSConfig.
+func WithServerName(name string) Option {
+	return func(o *dialOptions) {
+		o.serverName = name
+	}
+}
+
+// WithDialOption allows passing a raw grpc.DialOption for advanced use cases.
 func WithDialOption(opt grpc.DialOption) Option {
 	return func(o *dialOptions) {
 		o.dialOpts = append(o.dialOpts, opt)
 	}
 }
 
-// WithBlock enables blocking dial (wait until connection is ready) without relying on deprecated grpc.WithBlock()
+// WithBlock makes Dial wait until the connection reaches Ready state or the context expires.
 func WithBlock() Option {
 	return func(o *dialOptions) {
 		o.block = true
 	}
 }
 
-// Dial establishes a gRPC ClientConn using grpc.NewClient instead of DialContext.
-// It respects kit_client.WithBlock() and will wait for readiness using the provided context.
+// Dial creates a gRPC ClientConn. Transport credentials must be set explicitly;
+// use WithInsecure() for plaintext connections in dev/test.
 func Dial(ctx context.Context, target string, opts ...Option) (*grpc.ClientConn, error) {
-	// Collect options
 	dcfg := &dialOptions{}
 	for _, opt := range opts {
 		opt(dcfg)
@@ -112,40 +144,40 @@ func Dial(ctx context.Context, target string, opts ...Option) (*grpc.ClientConn,
 			return nil, dcfg.err
 		}
 	}
-	// Default to insecure if no credentials provided
-	if len(dcfg.dialOpts) == 0 {
-		dcfg.dialOpts = append(dcfg.dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	if !dcfg.hasTransportCredentials {
+		return nil, errors.New("no transport credentials set; use WithTLS, WithMTLS, WithTLSConfig, or WithInsecure")
 	}
 
-	// Determine if blocking dial is requested
-	block := dcfg.block
-	for _, o := range dcfg.dialOpts {
-		// Inspect string repr to detect legacy WithBlock
-		if fmt.Sprint(o) == "WithBlock()" {
-			block = true
-			break
+	// WithServerName only makes sense with a TLS config.
+	if dcfg.serverName != "" && dcfg.tlsCfg == nil {
+		return nil, errors.New("WithServerName requires WithTLS, WithMTLS, or WithTLSConfig; not compatible with WithInsecure")
+	}
+
+	// Finalize TLS credentials: apply ServerName override, then build grpc credential.
+	if dcfg.tlsCfg != nil {
+		if dcfg.serverName != "" {
+			dcfg.tlsCfg.ServerName = dcfg.serverName
 		}
+		dcfg.dialOpts = append(dcfg.dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(dcfg.tlsCfg)))
 	}
 
-	// Create ClientConn with grpc.NewClient
 	cc, err := grpc.NewClient(target, dcfg.dialOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to new client %s: %w", target, err)
+		return nil, fmt.Errorf("failed to create client for %s: %w", target, err)
 	}
 
-	// Kick out of idle mode
 	cc.Connect()
 
-	// If blocking dial, wait until ready or context done
-	if block {
-		// Use context deadline if set, otherwise deadline is ctx
+	if dcfg.block {
 		for {
 			s := cc.GetState()
 			if s == connectivity.Ready {
 				break
 			}
 			if !cc.WaitForStateChange(ctx, s) {
-				return nil, fmt.Errorf("connection failed: %w", ctx.Err())
+				_ = cc.Close()
+				return nil, fmt.Errorf("connection to %s failed: %w", target, ctx.Err())
 			}
 		}
 	}

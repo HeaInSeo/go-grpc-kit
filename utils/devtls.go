@@ -8,6 +8,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
@@ -96,7 +98,6 @@ func WithExtKeyUsage(usages ...x509.ExtKeyUsage) Option {
 
 // internal helper to generate a certificate template and private key.
 func makeCert(parent *x509.Certificate, parentKey *rsa.PrivateKey, validFor time.Duration, opts ...Option) (*x509.Certificate, *rsa.PrivateKey, []byte, error) {
-	// default options
 	o := &options{
 		keySize:            2048,
 		signatureAlgorithm: x509.SHA256WithRSA,
@@ -112,12 +113,14 @@ func makeCert(parent *x509.Certificate, parentKey *rsa.PrivateKey, validFor time
 		o.subject = pkix.Name{CommonName: "Dev CA"}
 		o.extKeyUsage = nil // CA certs typically don't have ExtKeyUsage
 	}
-	// apply user options
 	for _, opt := range opts {
 		opt(o)
 	}
 
-	// generate private key
+	if o.keySize < 2048 {
+		return nil, nil, nil, fmt.Errorf("RSA key size must be at least 2048 bits, got %d", o.keySize)
+	}
+
 	priv, err := rsa.GenerateKey(rand.Reader, o.keySize)
 	if err != nil {
 		return nil, nil, nil, err
@@ -186,11 +189,18 @@ func GenerateSelfSignedCA(validFor time.Duration, opts ...Option) (*x509.Certifi
 }
 
 // GenerateCert creates and signs a leaf certificate using a given CA certificate/key.
-//
-// When using this function directly, it is highly recommended to explicitly provide
-// WithExtKeyUsage option to define the certificate's purpose (e.g., for server or client authentication).
-// If not specified, the certificate will not have any extended key usages.
+// caCert and caKey must not be nil, and caCert must be a CA certificate.
+// Provide WithExtKeyUsage to define the certificate's purpose (ServerAuth, ClientAuth, etc.).
 func GenerateCert(caCert *x509.Certificate, caKey *rsa.PrivateKey, validFor time.Duration, opts ...Option) (*tls.Certificate, error) {
+	if caCert == nil {
+		return nil, errors.New("ca certificate is nil")
+	}
+	if caKey == nil {
+		return nil, errors.New("ca private key is nil")
+	}
+	if !caCert.IsCA {
+		return nil, errors.New("ca certificate is not a CA")
+	}
 	cert, priv, der, err := makeCert(caCert, caKey, validFor, opts...)
 	if err != nil {
 		return nil, err
@@ -204,13 +214,19 @@ func GenerateCert(caCert *x509.Certificate, caKey *rsa.PrivateKey, validFor time
 }
 
 // GenerateServerCert creates a server-only certificate signed by the given CA.
+// host may be a DNS name or an IP address; the SAN is set accordingly.
 func GenerateServerCert(caCert *x509.Certificate, caKey *rsa.PrivateKey, host string, validFor time.Duration) (*tls.Certificate, error) {
-	return GenerateCert(caCert, caKey, validFor,
+	opts := []Option{
 		WithSubject(pkix.Name{CommonName: host}),
-		WithDNSNames(host),
-		WithKeyUsage(x509.KeyUsageDigitalSignature|x509.KeyUsageKeyEncipherment),
+		WithKeyUsage(x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment),
 		WithExtKeyUsage(x509.ExtKeyUsageServerAuth),
-	)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		opts = append(opts, WithDNSNames(), WithIPAddresses(ip))
+	} else {
+		opts = append(opts, WithDNSNames(host))
+	}
+	return GenerateCert(caCert, caKey, validFor, opts...)
 }
 
 // GenerateClientCert creates a client-only certificate signed by the given CA.
@@ -223,7 +239,7 @@ func GenerateClientCert(caCert *x509.Certificate, caKey *rsa.PrivateKey, clientN
 	)
 }
 
-// WriteCertPEM writes a certificate DER to PEM file (0644, atomic).
+// WriteCertPEM writes a certificate DER to a PEM file (mode 0644).
 func WriteCertPEM(filename string, certDER []byte) error {
 	buf := new(bytes.Buffer)
 	if err := pem.Encode(buf, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}); err != nil {
@@ -232,7 +248,7 @@ func WriteCertPEM(filename string, certDER []byte) error {
 	return os.WriteFile(filename, buf.Bytes(), 0644)
 }
 
-// WriteKeyPEM writes an RSA private key to PEM file (0600, atomic).
+// WriteKeyPEM writes an RSA private key to a PEM file (mode 0600).
 func WriteKeyPEM(filename string, key *rsa.PrivateKey) error {
 	buf := new(bytes.Buffer)
 	if err := pem.Encode(buf, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {

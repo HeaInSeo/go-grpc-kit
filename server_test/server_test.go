@@ -5,211 +5,313 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"github.com/seoyhaein/go-grpc-kit/server"
-	"github.com/seoyhaein/go-grpc-kit/utils"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/HeaInSeo/go-grpc-kit/server"
+	"github.com/HeaInSeo/go-grpc-kit/utils"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
-	"net"
-	"os"
-	"syscall"
-	"testing"
-	"time"
 )
 
-func TestServerHealth(t *testing.T) {
-	// 테스트용 서버 주소
-	address := "localhost:50053"
-
-	// 기본 옵션과 HealthCheck, Reflection 서비스 등록
-	opts := server.DefaultServerOptions()
-	services := []server.RegisterServices{
-		server.WithHealthCheck(),
-		server.WithReflection(),
-	}
-
-	// 서버 실행
-	serverErrCh := make(chan error, 1)
-	go func() {
-		serverErrCh <- server.Server(address, opts, services...)
-	}()
-
-	// 서버가 시작될 시간을 잠시 대기
-	time.Sleep(200 * time.Millisecond)
-
-	// 서버에 연결
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	// deprecated 되었지만 테스트 코드에서는 이 메서드가 더 잘 맞음.
-	conn, err := grpc.DialContext(ctx, address,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(), // deprecated 되었지만 테스트 코드에서는 이 메서드가 더 잘 맞음.
-	)
-	if err != nil {
-		t.Fatalf("Failed to connect to gRPC server: %v", err)
-	}
-	defer func() {
-		if cErr := conn.Close(); cErr != nil {
-			t.Logf("Failed to close gRPC connection: %v", cErr)
-		}
-	}()
-
-	// Health check 호출
-	healthClient := grpc_health_v1.NewHealthClient(conn)
-	healthResp, err := healthClient.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{})
-	if err != nil {
-		t.Fatalf("Health check failed: %v", err)
-	}
-	if healthResp.Status != grpc_health_v1.HealthCheckResponse_SERVING {
-		t.Errorf("Expected SERVING, got %v", healthResp.Status)
-	}
-
-	// graceful shutdown: SIGINT 전송
-	proc, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatalf("Failed to find process: %v", err)
-	}
-	if err := proc.Signal(syscall.SIGINT); err != nil {
-		t.Fatalf("Failed to send SIGINT: %v", err)
-	}
-
-	// 서버 종료 대기 및 에러 검사
-	if err := <-serverErrCh; err != nil {
-		t.Errorf("Server shutdown returned error: %v", err)
-	}
-}
-
-// healthServerImpl implements the Health service.
+// healthServerImpl implements the gRPC Health service for tests.
 type healthServerImpl struct{}
 
-func (s *healthServerImpl) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+func (s *healthServerImpl) Check(_ context.Context, _ *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
 	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
 }
 
-func (s *healthServerImpl) Watch(req *grpc_health_v1.HealthCheckRequest, stream grpc_health_v1.Health_WatchServer) error {
+func (s *healthServerImpl) Watch(_ *grpc_health_v1.HealthCheckRequest, stream grpc_health_v1.Health_WatchServer) error {
 	return status.Errorf(codes.Unimplemented, "Watch not implemented")
 }
 
-func TestServerHealth_MTLS(t *testing.T) {
-	// 1) Start the mTLS gRPC server
-	srv, caCert, caKey, address, errCh := startMTLSServer(t)
-
-	// 2) Ensure server started without immediate error
-	select {
-	case serveErr := <-errCh:
-		t.Fatalf("server start failed: %v", serveErr)
-	default:
-	}
-
-	// 3) Plain TCP check
-	if conn, err := net.DialTimeout("tcp", address, 1*time.Second); err != nil {
-		t.Fatalf("⚠️ TCP connection failed: %v", err)
-	} else {
-		t.Log("✅ TCP connection OK")
-		conn.Close()
-	}
-
-	// 4) Generate a client certificate
-	clientCert, err := utils.GenerateClientCert(caCert, caKey, "client", 1*time.Hour)
+// startPlainServer starts a plaintext gRPC server on a free port and returns it with its address.
+func startPlainServer(t *testing.T) (*grpc.Server, string) {
+	t.Helper()
+	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
-		t.Fatalf("client cert generation failed: %v", err)
+		t.Fatalf("net.Listen failed: %v", err)
 	}
-
-	// 5) Build tls.Config for the client
-	rootCAs := x509.NewCertPool()
-	rootCAs.AddCert(caCert)
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{*clientCert},
-		RootCAs:      rootCAs,
-		ServerName:   "localhost",
-		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"h2"},
-	}
-
-	// 6) Plain TLS handshake + ALPN check
-	t.Log("🚧 Attempting plain TLS handshake")
-	plain, err := tls.Dial("tcp", address, tlsCfg)
-	if err != nil {
-		t.Fatalf("⚠️ Plain TLS handshake failed: %v", err)
-	}
-	state := plain.ConnectionState()
-	t.Logf("✅ Plain TLS OK, negotiated proto=%q", state.NegotiatedProtocol)
-	plain.Close()
-
-	// 7) gRPC DialContext (WithBlock + context timeout)
-	t.Log("🚧 Attempting gRPC DialContext with WithBlock")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(ctx, address,
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		t.Fatalf("⚠️ gRPC DialContext failed: %v", err)
-	}
-	defer conn.Close()
-	t.Log("✅ gRPC connection (mTLS+HTTP/2) established")
-
-	// 8) Health.Check RPC
-	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	hc := grpc_health_v1.NewHealthClient(conn)
-	resp, err := hc.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
-	if err != nil {
-		t.Fatalf("Health.Check RPC failed: %v", err)
-	}
-	if resp.Status != grpc_health_v1.HealthCheckResponse_SERVING {
-		t.Errorf("unexpected status: got %v, want SERVING", resp.Status)
-	}
-	t.Logf("✅ Health.Check RPC succeeded, status=%v", resp.Status)
-
-	// 9) Shutdown the server gracefully
-	srv.GracefulStop()
-
-	// 10) Wait for server to exit
-	if serveErr := <-errCh; serveErr != nil && serveErr != grpc.ErrServerStopped {
-		t.Errorf("server shutdown error: %v", serveErr)
-	} else {
-		t.Log("✅ Server shut down gracefully")
-	}
+	opts := server.DefaultServerOptions()
+	grpcSrv := grpc.NewServer(opts...)
+	server.WithHealthCheck()(grpcSrv)
+	go func() { _ = grpcSrv.Serve(lis) }()
+	return grpcSrv, lis.Addr().String()
 }
 
-// startMTLSServer starts a gRPC server with mTLS and returns the server, CA credentials, address, and serve error channel.
+// startMTLSServer starts a gRPC server with real mTLS (RequireAndVerifyClientCert).
+// Returns the server, CA cert, CA key, address, and a channel for serve errors.
 func startMTLSServer(t *testing.T) (*grpc.Server, *x509.Certificate, *rsa.PrivateKey, string, <-chan error) {
 	t.Helper()
 
-	// Generate CA and server certificates
-	caCert, caKey, err := utils.GenerateSelfSignedCA(1 * time.Hour)
+	caCert, caKey, err := utils.GenerateSelfSignedCA(time.Hour)
 	if err != nil {
 		t.Fatalf("CA generation failed: %v", err)
 	}
-	serverCert, err := utils.GenerateServerCert(caCert, caKey, "localhost", 1*time.Hour)
+	serverCert, err := utils.GenerateServerCert(caCert, caKey, "localhost", time.Hour)
 	if err != nil {
-		t.Fatalf("Server cert generation failed: %v", err)
+		t.Fatalf("server cert generation failed: %v", err)
 	}
 
-	// Create server TLS credentials
-	servCreds := credentials.NewServerTLSFromCert(serverCert)
+	clientCAs := x509.NewCertPool()
+	clientCAs.AddCert(caCert)
 
-	// Listen on a free loopback port
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{*serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+		MinVersion:   tls.VersionTLS12,
+	}
+
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("net.Listen failed: %v", err)
 	}
 
-	// Create and start gRPC server
-	grpcSrv := grpc.NewServer(grpc.Creds(servCreds))
+	grpcSrv := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsCfg)))
 	grpc_health_v1.RegisterHealthServer(grpcSrv, &healthServerImpl{})
-	reflection.Register(grpcSrv)
 
 	errCh := make(chan error, 1)
-	go func() {
-		errCh <- grpcSrv.Serve(lis)
-	}()
+	go func() { errCh <- grpcSrv.Serve(lis) }()
 
 	return grpcSrv, caCert, caKey, lis.Addr().String(), errCh
+}
+
+// clientTLSConfig builds a tls.Config for connecting to the mTLS server.
+func clientTLSConfig(caCert *x509.Certificate, clientCert *tls.Certificate) *tls.Config {
+	rootCAs := x509.NewCertPool()
+	rootCAs.AddCert(caCert)
+	cfg := &tls.Config{
+		RootCAs:    rootCAs,
+		ServerName: "localhost",
+		MinVersion: tls.VersionTLS12,
+	}
+	if clientCert != nil {
+		cfg.Certificates = []tls.Certificate{*clientCert}
+	}
+	return cfg
+}
+
+// TestServerHealth verifies plaintext health check over insecure gRPC.
+func TestServerHealth(t *testing.T) {
+	grpcSrv, address := startPlainServer(t)
+	defer grpcSrv.GracefulStop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, address,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
+
+	resp, err := grpc_health_v1.NewHealthClient(conn).Check(
+		context.Background(), &grpc_health_v1.HealthCheckRequest{},
+	)
+	if err != nil {
+		t.Fatalf("Health check failed: %v", err)
+	}
+	if resp.Status != grpc_health_v1.HealthCheckResponse_SERVING {
+		t.Errorf("expected SERVING, got %v", resp.Status)
+	}
+}
+
+// TestServerHealth_MTLS_Success verifies mTLS connection with a valid client cert.
+func TestServerHealth_MTLS_Success(t *testing.T) {
+	srv, caCert, caKey, address, errCh := startMTLSServer(t)
+	defer func() {
+		srv.GracefulStop()
+		if err := <-errCh; err != nil && err != grpc.ErrServerStopped {
+			t.Errorf("server shutdown error: %v", err)
+		}
+	}()
+
+	clientCert, err := utils.GenerateClientCert(caCert, caKey, "client", time.Hour)
+	if err != nil {
+		t.Fatalf("client cert generation failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, address,
+		grpc.WithTransportCredentials(credentials.NewTLS(clientTLSConfig(caCert, clientCert))),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		t.Fatalf("mTLS dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	resp, err := grpc_health_v1.NewHealthClient(conn).Check(
+		context.Background(), &grpc_health_v1.HealthCheckRequest{},
+	)
+	if err != nil {
+		t.Fatalf("Health.Check failed: %v", err)
+	}
+	if resp.Status != grpc_health_v1.HealthCheckResponse_SERVING {
+		t.Errorf("expected SERVING, got %v", resp.Status)
+	}
+}
+
+// TestServerHealth_MTLS_NoClientCert verifies the server rejects connections without a client cert.
+func TestServerHealth_MTLS_NoClientCert(t *testing.T) {
+	srv, caCert, _, address, errCh := startMTLSServer(t)
+	defer func() {
+		srv.GracefulStop()
+		<-errCh
+	}()
+
+	// TLS config with no client certificate
+	tlsCfg := clientTLSConfig(caCert, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := grpc.DialContext(ctx, address,
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+		grpc.WithBlock(),
+	)
+	if err == nil {
+		t.Fatal("expected connection to fail without client cert, but it succeeded")
+	}
+}
+
+// TestServerHealth_MTLS_WrongCA verifies the server rejects a client cert signed by an unknown CA.
+func TestServerHealth_MTLS_WrongCA(t *testing.T) {
+	srv, caCert, _, address, errCh := startMTLSServer(t)
+	defer func() {
+		srv.GracefulStop()
+		<-errCh
+	}()
+
+	// Generate a separate CA and sign a client cert with it
+	wrongCA, wrongCAKey, err := utils.GenerateSelfSignedCA(time.Hour)
+	if err != nil {
+		t.Fatalf("wrong CA generation failed: %v", err)
+	}
+	wrongClientCert, err := utils.GenerateClientCert(wrongCA, wrongCAKey, "evil-client", time.Hour)
+	if err != nil {
+		t.Fatalf("wrong client cert generation failed: %v", err)
+	}
+
+	// Use server's CA for root (so server cert validates), but present wrong client cert
+	tlsCfg := clientTLSConfig(caCert, wrongClientCert)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = grpc.DialContext(ctx, address,
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+		grpc.WithBlock(),
+	)
+	if err == nil {
+		t.Fatal("expected connection to fail with wrong CA client cert, but it succeeded")
+	}
+}
+
+// TestServerHealth_MTLS_WrongServerCA verifies the client rejects a server cert from an unknown CA.
+func TestServerHealth_MTLS_WrongServerCA(t *testing.T) {
+	srv, caCert, caKey, address, errCh := startMTLSServer(t)
+	defer func() {
+		srv.GracefulStop()
+		<-errCh
+	}()
+
+	// Use a different CA as the client's trusted root.
+	// Server cert is signed by the real CA, so the client won't trust it.
+	wrongCA, wrongCAKey, err := utils.GenerateSelfSignedCA(time.Hour)
+	if err != nil {
+		t.Fatalf("wrong CA generation failed: %v", err)
+	}
+
+	// Client cert must be signed by the real CA so the server accepts it;
+	// only the root of trust for the server cert is wrong.
+	clientCert, err := utils.GenerateClientCert(caCert, caKey, "client", time.Hour)
+	if err != nil {
+		t.Fatalf("client cert generation failed: %v", err)
+	}
+	_ = wrongCAKey // used only to confirm wrongCA is independent
+
+	tlsCfg := clientTLSConfig(wrongCA, clientCert)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err = grpc.DialContext(ctx, address,
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
+		grpc.WithBlock(),
+	)
+	if err == nil {
+		t.Fatal("expected connection to fail with wrong server CA, but it succeeded")
+	}
+}
+
+// TestRegisterHealth verifies that RegisterHealth returns a *health.Server whose status can be updated.
+func TestRegisterHealth(t *testing.T) {
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	opts := server.DefaultServerOptions()
+	grpcSrv := grpc.NewServer(opts...)
+	h := server.RegisterHealth(grpcSrv)
+	go func() { _ = grpcSrv.Serve(lis) }()
+	defer grpcSrv.GracefulStop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, lis.Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	hc := grpc_health_v1.NewHealthClient(conn)
+
+	// Default status should be SERVING.
+	resp, err := hc.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("Health.Check failed: %v", err)
+	}
+	if resp.Status != grpc_health_v1.HealthCheckResponse_SERVING {
+		t.Errorf("expected SERVING, got %v", resp.Status)
+	}
+
+	// Update to NOT_SERVING and verify.
+	h.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	resp, err = hc.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("Health.Check after NOT_SERVING failed: %v", err)
+	}
+	if resp.Status != grpc_health_v1.HealthCheckResponse_NOT_SERVING {
+		t.Errorf("expected NOT_SERVING, got %v", resp.Status)
+	}
+}
+
+// TestServerAsync_ErrCh verifies that ServerAsync's error channel closes cleanly on GracefulStop.
+func TestServerAsync_ErrCh(t *testing.T) {
+	opts := server.DefaultServerOptions()
+	grpcSrv, errCh, err := server.ServerAsync("localhost:0", opts, server.WithHealthCheck())
+	if err != nil {
+		t.Fatalf("ServerAsync failed: %v", err)
+	}
+	grpcSrv.GracefulStop()
+
+	// errCh must close without sending an error on clean shutdown.
+	select {
+	case err, ok := <-errCh:
+		if ok && err != nil {
+			t.Errorf("unexpected error from errCh: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("errCh did not close after GracefulStop")
+	}
 }
